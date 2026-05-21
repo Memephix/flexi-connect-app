@@ -1,3 +1,22 @@
+/**
+ * /client/pose — YOLOv8-Pose + Random Forest + Form Classifier
+ * ทำงานใน browser 100% ผ่าน onnxruntime-web
+ *
+ * วางไฟล์เหล่านี้ใน public/models/ ก่อน:
+ *   - yolov8n-pose.onnx   (~6 MB)  — จาก ultralytics export
+ *   - pose_rf.onnx         (~1 MB)  — จาก convert_models_to_onnx.py
+ *   - form_clf.onnx        (~1 MB)  — จาก convert_models_to_onnx.py
+ *   - model_meta_export.json        — feature/class lists
+ *
+ * FIX v4:
+ *   - postprocessYolo auto-detect shape [1,56,8400] vs [1,8400,56]
+ *   - conf threshold ลดเป็น 0.25
+ *   - runClassifiers ใช้ object key แทน array destructuring
+ *   - log outputNames ตอน load model
+ *   - non-blocking loop: setTimeout + isProcessing flag (ไม่ค้าง UI)
+ *   - target ~4 fps (YOLO WASM ~1300ms → schedule ทุก 1500ms)
+ */
+
 import { createFileRoute } from "@tanstack/react-router";
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { useAuth } from "@/hooks/use-auth";
@@ -349,9 +368,10 @@ function PoseAnalyzer() {
   const [latency,    setLatency]    = useState(0);
   const [frameCount, setFrameCount] = useState(0);
 
-  const videoRef  = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rafRef    = useRef<number>();
+  const videoRef       = useRef<HTMLVideoElement>(null);
+  const canvasRef      = useRef<HTMLCanvasElement>(null);
+  const timerRef       = useRef<ReturnType<typeof setTimeout>>();   // ✅ FIX v4
+  const isProcessing   = useRef(false);                             // ✅ FIX v4: ป้องกัน queue ซ้อน
 
   // mutable refs (no re-render)
   const repCtrRef   = useRef(new RepCounter());
@@ -398,64 +418,94 @@ function PoseAnalyzer() {
     }
   }, []);
 
-  // ── Process one frame ────────────────────────────────────────────────────────
+  // ── Process one frame (non-blocking) ────────────────────────────────────────
+  //
+  // ✅ FIX v4: แทน requestAnimationFrame loop ด้วย setTimeout
+  //   - isProcessing flag กัน queue ซ้อน
+  //   - schedule ครั้งต่อไปหลัง inference จบเท่านั้น → UI ไม่ค้าง
+  //   - INFER_INTERVAL = 250ms → ~4 fps (เพียงพอสำหรับ squat analysis)
+
+  const INFER_INTERVAL = 250; // ms — ปรับได้ (ต่ำ = เร็วขึ้น แต่ UI อาจหน่วง)
+
+  const scheduleNext = useCallback(() => {
+    timerRef.current = setTimeout(() => processFrame(), INFER_INTERVAL);
+  }, []);  // processFrame จะถูก assign ด้านล่าง — ใช้ ref แทน
+
+  const processFrameRef = useRef<() => Promise<void>>();
+
   const processFrame = useCallback(async () => {
+    // ป้องกัน call ซ้อนถ้า inference ยังไม่จบ
+    if (isProcessing.current) {
+      timerRef.current = setTimeout(() => processFrameRef.current?.(), INFER_INTERVAL);
+      return;
+    }
+
     const vid = videoRef.current;
     const cvs = canvasRef.current;
     if (!vid || !cvs || vid.paused || vid.ended) return;
     if (!yoloRef.current || !poseRfRef.current || !formClfRef.current || !metaRef.current) return;
 
+    isProcessing.current = true;
     const t0 = performance.now();
 
-    // 1. Preprocess
-    const { tensor, scale, padX, padY } = preprocessFrame(vid, tmpCanvasRef.current!);
+    try {
+      // 1. Preprocess
+      const { tensor, scale, padX, padY } = preprocessFrame(vid, tmpCanvasRef.current!);
 
-    // 2. YOLOv8 inference
-    const yoloOut = await yoloRef.current.run({ images: tensor });
-    const output  = yoloOut[Object.keys(yoloOut)[0]];
+      // 2. YOLOv8 inference
+      const yoloOut = await yoloRef.current.run({ images: tensor });
+      const output  = yoloOut[Object.keys(yoloOut)[0]];
 
-    // ✅ FIX: ส่ง conf threshold ที่ต่ำลง
-    const kps = postprocessYolo(
-      output,
-      CONF_THRESH,
-      scale, padX, padY,
-      vid.videoWidth, vid.videoHeight,
-    );
+      const kps = postprocessYolo(
+        output,
+        CONF_THRESH,
+        scale, padX, padY,
+        vid.videoWidth, vid.videoHeight,
+      );
 
-    const ctx = cvs.getContext("2d")!;
-    ctx.clearRect(0, 0, cvs.width, cvs.height);
+      const ctx = cvs.getContext("2d")!;
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
 
-    if (kps) {
-      // 3. Classify
-      const res = await runClassifiers(kps, poseRfRef.current, formClfRef.current, metaRef.current);
+      if (kps) {
+        // 3. Classify
+        const res = await runClassifiers(kps, poseRfRef.current, formClfRef.current, metaRef.current);
 
-      // 4. Rep counting
-      const kneeAngle = res.features["left_knee"] ?? 180;
-      const reps = repCtrRef.current.update(kneeAngle);
-      setRepCount(reps);
+        // 4. Rep counting
+        const kneeAngle = res.features["left_knee"] ?? 180;
+        const reps = repCtrRef.current.update(kneeAngle);
+        setRepCount(reps);
 
-      // 5. Running form score
-      totalRef.current++;
-      if (res.form === "Good") goodRef.current++;
-      const runningScore = totalRef.current > 0
-        ? Math.round((goodRef.current / totalRef.current) * 100)
-        : 0;
-      setFormScore(runningScore);
+        // 5. Running form score
+        totalRef.current++;
+        if (res.form === "Good") goodRef.current++;
+        const runningScore = totalRef.current > 0
+          ? Math.round((goodRef.current / totalRef.current) * 100)
+          : 0;
+        setFormScore(runningScore);
 
-      // 6. Update UI
-      setExercise(res.exercise);
-      setPoseConf(res.poseConf);
-      setForm(res.form);
-      setFormConf(res.formConf);
-      setFrameCount((n) => n + 1);
+        // 6. Update UI
+        setExercise(res.exercise);
+        setPoseConf(res.poseConf);
+        setForm(res.form);
+        setFormConf(res.formConf);
+        setFrameCount((n) => n + 1);
 
-      // 7. Draw on canvas
-      drawResults(ctx, kps, res, vid.videoWidth, vid.videoHeight, cvs.width, cvs.height);
+        // 7. Draw on canvas
+        drawResults(ctx, kps, res, vid.videoWidth, vid.videoHeight, cvs.width, cvs.height);
+      }
+
+      setLatency(Math.round(performance.now() - t0));
+    } finally {
+      isProcessing.current = false;
+      // Schedule ครั้งต่อไปหลัง inference จบเท่านั้น — ไม่ queue ซ้อน
+      if (!vid?.paused && !vid?.ended) {
+        timerRef.current = setTimeout(() => processFrameRef.current?.(), INFER_INTERVAL);
+      }
     }
-
-    setLatency(Math.round(performance.now() - t0));
-    rafRef.current = requestAnimationFrame(processFrame);
   }, []);
+
+  // เก็บ ref ล่าสุดของ processFrame เพื่อให้ setTimeout เรียกได้
+  useEffect(() => { processFrameRef.current = processFrame; }, [processFrame]);
 
   // ── Draw skeleton + overlay ──────────────────────────────────────────────────
   function drawResults(
@@ -519,12 +569,13 @@ function PoseAnalyzer() {
     setRepCount(0); setFormScore(0); setFrameCount(0);
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
+    isProcessing.current = false;
     setAnalyzing(true);
-    rafRef.current = requestAnimationFrame(processFrame);
+    timerRef.current = setTimeout(() => processFrameRef.current?.(), 0); // ✅ FIX v4
   };
 
   const stopAnalysis = useCallback(async () => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearTimeout(timerRef.current);  // ✅ FIX v4
     videoRef.current?.pause();
     setAnalyzing(false);
 
@@ -558,7 +609,7 @@ function PoseAnalyzer() {
 
   useEffect(() => () => {
     if (videoSrc) URL.revokeObjectURL(videoSrc);
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearTimeout(timerRef.current);   // ✅ FIX v4
   }, [videoSrc]);
 
   const { data: history } = useQuery({
