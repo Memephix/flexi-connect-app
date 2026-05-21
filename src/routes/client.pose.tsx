@@ -1,19 +1,3 @@
-/**
- * /client/pose — YOLOv8-Pose + Random Forest + Form Classifier
- * ทำงานใน browser 100% ผ่าน onnxruntime-web
- *
- * วางไฟล์เหล่านี้ใน public/models/ ก่อน:
- *   - yolov8n-pose.onnx   (~6 MB)  — จาก ultralytics export
- *   - pose_rf.onnx         (~1 MB)  — จาก convert_models_to_onnx.py
- *   - form_clf.onnx        (~1 MB)  — จาก convert_models_to_onnx.py
- *   - model_meta_export.json        — feature/class lists
- *
- * FIX v2:
- *   - postprocessYolo auto-detect shape [1,56,8400] vs [1,8400,56]
- *   - conf threshold ลดเป็น 0.25
- *   - debug log แสดง maxConf ใน console
- */
-
 import { createFileRoute } from "@tanstack/react-router";
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { useAuth } from "@/hooks/use-auth";
@@ -296,16 +280,24 @@ async function runClassifiers(
     features,
   };
 
+  // ── helper: ดึง key ที่ถูกต้องจาก output object ──────────────────────────
+  const getLabelKey = (keys: string[]) =>
+    keys.find((k) => k.toLowerCase().includes("label")) ?? keys[0];
+  const getProbKey  = (keys: string[]) =>
+    keys.find((k) => k.toLowerCase().includes("prob"))  ?? keys[1] ?? keys[0];
+
   // Model 1: classify pose
   const hasPoseFeats = meta.pose_features.every((c) => c in features);
   if (hasPoseFeats) {
     const poseFeat  = toVector(meta.pose_features, 180);
     const poseInput = { float_input: new ort.Tensor("float32", poseFeat, [1, meta.pose_features.length]) };
-    const [labels, probs] = await poseSession.run(poseInput);
-    const labelArr  = labels.data as any;
-    result.exercise = String(labelArr[0]);
-    const probArr   = probs.data as Float32Array;
-    result.poseConf = Math.max(...Array.from(probArr));
+
+    // ✅ FIX: run() returns object — ไม่ใช่ array ห้าม destructure
+    const poseOut   = await poseSession.run(poseInput);
+    const pKeys     = Object.keys(poseOut);
+    result.exercise = String(poseOut[getLabelKey(pKeys)].data[0]);
+    const probData  = poseOut[getProbKey(pKeys)].data as Float32Array;
+    result.poseConf = Math.max(...Array.from(probData));
   }
 
   // Model 2: form check (เฉพาะ Squat)
@@ -314,11 +306,13 @@ async function runClassifiers(
     if (hasFormFeats) {
       const formFeat  = toVector(meta.form_features, 90);
       const formInput = { float_input: new ort.Tensor("float32", formFeat, [1, meta.form_features.length]) };
-      const [fLabels, fProbs] = await formSession.run(formInput);
-      const fLabelArr = fLabels.data as any;
-      result.form     = String(fLabelArr[0]);
-      const fProbArr  = fProbs.data as Float32Array;
-      result.formConf = Math.max(...Array.from(fProbArr));
+
+      // ✅ FIX: เหมือนกัน
+      const formOut   = await formSession.run(formInput);
+      const fKeys     = Object.keys(formOut);
+      result.form     = String(formOut[getLabelKey(fKeys)].data[0]);
+      const fProbData = formOut[getProbKey(fKeys)].data as Float32Array;
+      result.formConf = Math.max(...Array.from(fProbData));
       result.hasError = result.form === "Bad";
     }
   }
@@ -389,6 +383,10 @@ function PoseAnalyzer() {
       });
 
       tmpCanvasRef.current = document.createElement("canvas");
+
+      // debug: log output names ครั้งเดียว (ลบทิ้งหลัง confirm)
+      console.log("[pose_rf]  outputNames:", poseRfRef.current!.outputNames);
+      console.log("[form_clf] outputNames:", formClfRef.current!.outputNames);
 
       setLoadState("ready");
       setLoadMsg("โมเดลพร้อมใช้งาน");
