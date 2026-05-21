@@ -7,6 +7,11 @@
  *   - pose_rf.onnx         (~1 MB)  — จาก convert_models_to_onnx.py
  *   - form_clf.onnx        (~1 MB)  — จาก convert_models_to_onnx.py
  *   - model_meta_export.json        — feature/class lists
+ *
+ * FIX v2:
+ *   - postprocessYolo auto-detect shape [1,56,8400] vs [1,8400,56]
+ *   - conf threshold ลดเป็น 0.25
+ *   - debug log แสดง maxConf ใน console
  */
 
 import { createFileRoute } from "@tanstack/react-router";
@@ -37,7 +42,8 @@ export const Route = createFileRoute("/client/pose")({
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MODEL_BASE = "/models";
-const INPUT_SIZE = 640; // YOLOv8 input
+const INPUT_SIZE = 640;
+const CONF_THRESH = 0.25; // ✅ FIX: ลดจาก 0.4 → 0.25
 
 /** COCO 17-keypoint indices */
 const KP = {
@@ -73,13 +79,13 @@ interface ModelMeta {
 interface FrameResult {
   exercise: string;
   poseConf: number;
-  form: string;       // "Good" | "Bad" | "N/A"
+  form: string;
   formConf: number;
   hasError: boolean;
   features: Record<string, number>;
 }
 
-// ─── Geometry (ตรงกับ notebook extract_features เป๊ะ) ────────────────────────
+// ─── Geometry ────────────────────────────────────────────────────────────────
 
 function calcAngle(
   a: [number, number],
@@ -94,21 +100,18 @@ function calcAngle(
   return (Math.acos(Math.max(-1, Math.min(1, dot / (magBa * magBc)))) * 180) / Math.PI;
 }
 
-/** คัดลอก logic จาก extract_features() ใน notebook เป๊ะ */
 function extractFeatures(kps: Kp[]): Record<string, number> {
   const f: Record<string, number> = {};
   const ok = (...idxs: number[]) => idxs.every((i) => kps[i]?.conf > 0);
   const xy = (i: number): [number, number] => [kps[i].x, kps[i].y];
 
-  // features เดิม
   if (ok(11, 13, 15)) f["left_knee"]  = calcAngle(xy(11), xy(13), xy(15));
   if (ok(12, 14, 16)) f["right_knee"] = calcAngle(xy(12), xy(14), xy(16));
   if (ok(5,  11, 13)) f["left_hip"]   = calcAngle(xy(5),  xy(11), xy(13));
   if (ok(6,  12, 14)) f["right_hip"]  = calcAngle(xy(6),  xy(12), xy(14));
-  if ("left_knee"  in f && "right_knee" in f)
+  if ("left_knee" in f && "right_knee" in f)
     f["knee_symmetry"] = Math.abs(f["left_knee"] - f["right_knee"]);
 
-  // features ใหม่
   if (ok(5,  11, 13)) f["trunk_lean"]        = calcAngle(xy(5),  xy(11), xy(13));
   if (ok(13, 15, 11)) f["left_ankle_flex"]   = calcAngle(xy(13), xy(15), xy(11));
   if (ok(14, 16, 12)) f["right_ankle_flex"]  = calcAngle(xy(14), xy(16), xy(12));
@@ -120,9 +123,8 @@ function extractFeatures(kps: Kp[]): Record<string, number> {
   return f;
 }
 
-// ─── YOLOv8 Preprocessing ─────────────────────────────────────────────────────
+// ─── YOLOv8 Preprocessing ────────────────────────────────────────────────────
 
-/** แปลง video frame → Float32Array [1, 3, 640, 640] normalized [0,1] */
 function preprocessFrame(
   video: HTMLVideoElement,
   tmpCanvas: HTMLCanvasElement,
@@ -130,7 +132,6 @@ function preprocessFrame(
   const ctx = tmpCanvas.getContext("2d", { willReadFrequently: true })!;
   const vw = video.videoWidth, vh = video.videoHeight;
 
-  // letterbox: fit vw×vh into INPUT_SIZE×INPUT_SIZE
   const scale = Math.min(INPUT_SIZE / vw, INPUT_SIZE / vh);
   const nw = Math.round(vw * scale), nh = Math.round(vh * scale);
   const padX = (INPUT_SIZE - nw) / 2, padY = (INPUT_SIZE - nh) / 2;
@@ -138,7 +139,7 @@ function preprocessFrame(
   tmpCanvas.width  = INPUT_SIZE;
   tmpCanvas.height = INPUT_SIZE;
 
-  ctx.fillStyle = "#808080"; // grey pad
+  ctx.fillStyle = "#808080";
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(video, padX, padY, nw, nh);
 
@@ -146,12 +147,11 @@ function preprocessFrame(
   const { data } = imgData;
   const n = INPUT_SIZE * INPUT_SIZE;
 
-  // RGBA → CHW float32 /255
   const float32 = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) {
-    float32[i]         = data[i * 4]     / 255; // R
-    float32[n + i]     = data[i * 4 + 1] / 255; // G
-    float32[2 * n + i] = data[i * 4 + 2] / 255; // B
+    float32[i]         = data[i * 4]     / 255;
+    float32[n + i]     = data[i * 4 + 1] / 255;
+    float32[2 * n + i] = data[i * 4 + 2] / 255;
   }
 
   return {
@@ -162,11 +162,16 @@ function preprocessFrame(
   };
 }
 
-// ─── YOLOv8 Postprocessing ────────────────────────────────────────────────────
+// ─── YOLOv8 Postprocessing (FIXED) ───────────────────────────────────────────
 
-/** NMS — เลือก detection ที่ conf สูงสุด (ไม่ทำ full NMS เพราะ pose เราสนใจแค่คนเดียว) */
+/**
+ * ✅ FIX: auto-detect output shape
+ *   Ultralytics ONNX export มีได้ 2 แบบ:
+ *   - [1, 56, 8400]  → CHW / column-major  (รุ่นเก่า)
+ *   - [1, 8400, 56]  → HWC / row-major     (รุ่นใหม่ ส่วนใหญ่)
+ */
 function postprocessYolo(
-  output: ort.Tensor,   // [1, 56, 8400]
+  output: ort.Tensor,
   confThresh: number,
   scale: number,
   padX: number,
@@ -175,37 +180,77 @@ function postprocessYolo(
   origH: number,
 ): Kp[] | null {
   const data = output.data as Float32Array;
-  // shape [1, 56, 8400] → dims[1]=56, dims[2]=8400
-  const numDet    = 8400;
-  const stride    = 56;   // 4 bbox + 1 conf + 17*3 kps
+  const dims = output.dims;
 
+  // ── Detect layout ──────────────────────────────────────────────────────────
+  let numDet: number;
+  let isHWC: boolean; // true = [1, N, 56], false = [1, 56, N]
+
+  if (dims.length === 3) {
+    if (dims[1] === 56) {
+      // [1, 56, N] — CHW
+      numDet = dims[2];
+      isHWC  = false;
+    } else {
+      // [1, N, 56] — HWC
+      numDet = dims[1];
+      isHWC  = true;
+    }
+  } else {
+    // fallback: assume HWC with 8400 dets
+    numDet = 8400;
+    isHWC  = true;
+  }
+
+  // ── Find best detection ───────────────────────────────────────────────────
   let bestConf = confThresh;
   let bestOffset = -1;
+  let debugMaxConf = 0;
 
-  // หา detection ที่ confidence สูงที่สุด
   for (let d = 0; d < numDet; d++) {
-    const conf = data[4 * numDet + d]; // row 4 = objectness
+    const conf = isHWC
+      ? data[d * 56 + 4]       // HWC: row d, col 4
+      : data[4 * numDet + d];  // CHW: row 4, col d
+    if (conf > debugMaxConf) debugMaxConf = conf;
     if (conf > bestConf) {
       bestConf   = conf;
       bestOffset = d;
     }
   }
 
+  // Debug log (ลบทิ้งหลัง confirm)
+  console.log(
+    `[YOLO] shape=${dims.join("×")} layout=${isHWC ? "HWC" : "CHW"} ` +
+    `numDet=${numDet} maxConf=${debugMaxConf.toFixed(3)} ` +
+    `threshold=${confThresh} bestOffset=${bestOffset}`,
+  );
+
   if (bestOffset === -1) return null;
 
+  // ── Extract 17 keypoints ──────────────────────────────────────────────────
   const d = bestOffset;
   const kps: Kp[] = [];
 
   for (let k = 0; k < 17; k++) {
-    const base = (5 + k * 3) * numDet;
-    // undo letterbox
-    const px = (data[base + d]           - padX) / scale;
-    const py = (data[(base + numDet) + d] - padY) / scale;
-    const pc =  data[(base + 2 * numDet) + d];
+    let px: number, py: number, pc: number;
+
+    if (isHWC) {
+      // [1, N, 56]: det d → base = d*56, kp k → +5+k*3
+      const base = d * 56 + 5 + k * 3;
+      px = data[base];
+      py = data[base + 1];
+      pc = data[base + 2];
+    } else {
+      // [1, 56, N]: row r → r*numDet + d
+      const base = (5 + k * 3) * numDet;
+      px = data[base + d];
+      py = data[base + numDet + d];
+      pc = data[base + 2 * numDet + d];
+    }
 
     kps.push({
-      x: Math.max(0, Math.min(origW, px)),
-      y: Math.max(0, Math.min(origH, py)),
+      x: Math.max(0, Math.min(origW, (px - padX) / scale)),
+      y: Math.max(0, Math.min(origH, (py - padY) / scale)),
       conf: pc,
     });
   }
@@ -213,7 +258,7 @@ function postprocessYolo(
   return kps;
 }
 
-// ─── Rep Counter (ตรง notebook) ───────────────────────────────────────────────
+// ─── Rep Counter ─────────────────────────────────────────────────────────────
 
 class RepCounter {
   count = 0;
@@ -254,10 +299,10 @@ async function runClassifiers(
   // Model 1: classify pose
   const hasPoseFeats = meta.pose_features.every((c) => c in features);
   if (hasPoseFeats) {
-    const poseFeat = toVector(meta.pose_features, 180);
+    const poseFeat  = toVector(meta.pose_features, 180);
     const poseInput = { float_input: new ort.Tensor("float32", poseFeat, [1, meta.pose_features.length]) };
     const [labels, probs] = await poseSession.run(poseInput);
-    const labelArr = labels.data as BigInt64Array | Int64Array | string[] | any;
+    const labelArr  = labels.data as any;
     result.exercise = String(labelArr[0]);
     const probArr   = probs.data as Float32Array;
     result.poseConf = Math.max(...Array.from(probArr));
@@ -299,26 +344,25 @@ function PoseAnalyzer() {
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // session state
-  const [videoSrc,      setVideoSrc]      = useState<string | null>(null);
-  const [analyzing,     setAnalyzing]     = useState(false);
-  const [exercise,      setExercise]      = useState("—");
-  const [poseConf,      setPoseConf]      = useState(0);
-  const [form,          setForm]          = useState("N/A");
-  const [formConf,      setFormConf]      = useState(0);
-  const [formScore,     setFormScore]     = useState(0);
-  const [repCount,      setRepCount]      = useState(0);
-  const [latency,       setLatency]       = useState(0);
-  const [frameCount,    setFrameCount]    = useState(0);
+  const [videoSrc,   setVideoSrc]   = useState<string | null>(null);
+  const [analyzing,  setAnalyzing]  = useState(false);
+  const [exercise,   setExercise]   = useState("—");
+  const [poseConf,   setPoseConf]   = useState(0);
+  const [form,       setForm]       = useState("N/A");
+  const [formConf,   setFormConf]   = useState(0);
+  const [formScore,  setFormScore]  = useState(0);
+  const [repCount,   setRepCount]   = useState(0);
+  const [latency,    setLatency]    = useState(0);
+  const [frameCount, setFrameCount] = useState(0);
 
   const videoRef  = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef    = useRef<number>();
 
   // mutable refs (no re-render)
-  const repCtrRef    = useRef(new RepCounter());
-  const maxScoreRef  = useRef(0);
-  const goodRef      = useRef(0);
-  const totalRef     = useRef(0);
+  const repCtrRef   = useRef(new RepCounter());
+  const goodRef     = useRef(0);
+  const totalRef    = useRef(0);
 
   // ── Load all models ──────────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
@@ -370,9 +414,15 @@ function PoseAnalyzer() {
 
     // 2. YOLOv8 inference
     const yoloOut = await yoloRef.current.run({ images: tensor });
-    const output  = yoloOut[Object.keys(yoloOut)[0]]; // [1, 56, 8400]
+    const output  = yoloOut[Object.keys(yoloOut)[0]];
 
-    const kps = postprocessYolo(output, 0.4, scale, padX, padY, vid.videoWidth, vid.videoHeight);
+    // ✅ FIX: ส่ง conf threshold ที่ต่ำลง
+    const kps = postprocessYolo(
+      output,
+      CONF_THRESH,
+      scale, padX, padY,
+      vid.videoWidth, vid.videoHeight,
+    );
 
     const ctx = cvs.getContext("2d")!;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
@@ -468,7 +518,6 @@ function PoseAnalyzer() {
     if (!videoRef.current || !videoSrc || loadState !== "ready") return;
     repCtrRef.current = new RepCounter();
     goodRef.current = totalRef.current = 0;
-    maxScoreRef.current = 0;
     setRepCount(0); setFormScore(0); setFrameCount(0);
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
@@ -554,7 +603,7 @@ function PoseAnalyzer() {
           "rounded-xl border p-4 flex items-center justify-between",
           loadState === "error"   ? "border-destructive/50 bg-destructive/5" :
           loadState === "loading" ? "border-primary/30 bg-primary/5" :
-          "border-border bg-card"
+          "border-border bg-card",
         )}>
           <div className="flex items-center gap-3">
             {loadState === "loading" ? (
@@ -713,13 +762,13 @@ function PoseAnalyzer() {
           {/* Live stats */}
           <div className="rounded-xl border border-border bg-card p-4 space-y-3">
             <div className="text-xs uppercase tracking-widest text-muted-foreground">สถิติ Live</div>
-            <Row label="ท่าที่พบ"       value={exercise} />
-            <Row label="Form"            value={form} valueClass={formColor} />
-            <Row label="Form Score"      value={`${formScore}%`} />
-            <Row label="Reps"            value={String(repCount)} />
-            <Row label="Pose Conf"       value={`${(poseConf * 100).toFixed(1)}%`} />
-            <Row label="Form Conf"       value={`${(formConf * 100).toFixed(1)}%`} />
-            <Row label="Latency/frame"   value={`${latency} ms`} mono />
+            <Row label="ท่าที่พบ"     value={exercise} />
+            <Row label="Form"          value={form} valueClass={formColor} />
+            <Row label="Form Score"    value={`${formScore}%`} />
+            <Row label="Reps"          value={String(repCount)} />
+            <Row label="Pose Conf"     value={`${(poseConf * 100).toFixed(1)}%`} />
+            <Row label="Form Conf"     value={`${(formConf * 100).toFixed(1)}%`} />
+            <Row label="Latency/frame" value={`${latency} ms`} mono />
           </div>
 
           {/* History */}
