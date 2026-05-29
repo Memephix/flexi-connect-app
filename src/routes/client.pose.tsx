@@ -407,7 +407,7 @@ function PoseAnalyzer() {
   //   Canvas วาด skeleton ทับ video ปัจจุบัน (ไม่ใช่ frame เก่า)
   //   Schedule ครั้งต่อไปหลัง inference จบเท่านั้น → ไม่มี queue ซ้อน
 
-  const INFER_INTERVAL = 100; // ms หลัง inference จบ ก็ schedule ต่อทันที
+  const INFER_INTERVAL = 50; // ms หลัง inference จบ ก็ schedule ต่อทันที
 
   const processFrameRef = useRef<() => Promise<void>>();
 
