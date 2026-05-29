@@ -12,8 +12,9 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import * as ort from "onnxruntime-web";
 
-// ort WASM path — ใช้ CDN เดียวกับที่ vite bundle ไว้
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency ?? 4);
+ort.env.wasm.simd = true;
 
 export const Route = createFileRoute("/client/pose")({
   component: () => (
@@ -26,8 +27,11 @@ export const Route = createFileRoute("/client/pose")({
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MODEL_BASE = "/models";
-const INPUT_SIZE = 640;
-const CONF_THRESH = 0.25; // ✅ FIX: ลดจาก 0.4 → 0.25
+const CONF_THRESH = 0.2;
+const DISPLAY_LERP = 0.75;
+const PREDICT_MS = 80; // extrapolate skeleton ahead to compensate inference delay
+const CLASSIFY_EVERY_N = 4;
+const UI_UPDATE_MS = 200;
 
 /** COCO 17-keypoint indices */
 const KP = {
@@ -107,139 +111,46 @@ function extractFeatures(kps: Kp[]): Record<string, number> {
   return f;
 }
 
-// ─── YOLOv8 Preprocessing ────────────────────────────────────────────────────
-
-function preprocessFrame(
-  video: HTMLVideoElement,
-  tmpCanvas: HTMLCanvasElement,
-): { tensor: ort.Tensor; scale: number; padX: number; padY: number } {
-  const ctx = tmpCanvas.getContext("2d", { willReadFrequently: true })!;
-  const vw = video.videoWidth, vh = video.videoHeight;
-
-  const scale = Math.min(INPUT_SIZE / vw, INPUT_SIZE / vh);
-  const nw = Math.round(vw * scale), nh = Math.round(vh * scale);
-  const padX = (INPUT_SIZE - nw) / 2, padY = (INPUT_SIZE - nh) / 2;
-
-  tmpCanvas.width  = INPUT_SIZE;
-  tmpCanvas.height = INPUT_SIZE;
-
-  ctx.fillStyle = "#808080";
-  ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
-  ctx.drawImage(video, padX, padY, nw, nh);
-
-  const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
-  const { data } = imgData;
-  const n = INPUT_SIZE * INPUT_SIZE;
-
-  const float32 = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {
-    float32[i]         = data[i * 4]     / 255;
-    float32[n + i]     = data[i * 4 + 1] / 255;
-    float32[2 * n + i] = data[i * 4 + 2] / 255;
-  }
-
-  return {
-    tensor: new ort.Tensor("float32", float32, [1, 3, INPUT_SIZE, INPUT_SIZE]),
-    scale,
-    padX,
-    padY,
-  };
+/** Map video-pixel keypoints → canvas overlay coordinates. */
+function videoKpsToCanvas(kps: Kp[], vw: number, vh: number, cvW: number, cvH: number): Kp[] {
+  if (!vw || !vh || (cvW === vw && cvH === vh)) return kps;
+  const sx = cvW / vw;
+  const sy = cvH / vh;
+  return kps.map((k) => ({ x: k.x * sx, y: k.y * sy, conf: k.conf }));
 }
 
-// ─── YOLOv8 Postprocessing (FIXED) ───────────────────────────────────────────
+type Vel = { vx: number; vy: number };
 
-/**
- * ✅ FIX: auto-detect output shape
- *   Ultralytics ONNX export มีได้ 2 แบบ:
- *   - [1, 56, 8400]  → CHW / column-major  (รุ่นเก่า)
- *   - [1, 8400, 56]  → HWC / row-major     (รุ่นใหม่ ส่วนใหญ่)
- */
-function postprocessYolo(
-  output: ort.Tensor,
-  confThresh: number,
-  scale: number,
-  padX: number,
-  padY: number,
-  origW: number,
-  origH: number,
-): Kp[] | null {
-  const data = output.data as Float32Array;
-  const dims = output.dims;
+function lerpKeypoints(current: Kp[] | null, target: Kp[], factor: number): Kp[] {
+  if (!current) return target.map((k) => ({ ...k }));
+  return target.map((t, i) => {
+    const c = current[i];
+    if (!c || t.conf < 0.2) return { ...t };
+    return {
+      x: c.x + (t.x - c.x) * factor,
+      y: c.y + (t.y - c.y) * factor,
+      conf: t.conf,
+    };
+  });
+}
 
-  // ── Detect layout ──────────────────────────────────────────────────────────
-  let numDet: number;
-  let isHWC: boolean; // true = [1, N, 56], false = [1, 56, N]
+function updateVelocity(prev: Kp[] | null, next: Kp[], prevT: number, now: number): Vel[] | null {
+  if (!prev || now <= prevT) return null;
+  const dt = (now - prevT) / 1000;
+  if (dt <= 0) return null;
+  return next.map((n, i) => ({
+    vx: (n.x - prev[i].x) / dt,
+    vy: (n.y - prev[i].y) / dt,
+  }));
+}
 
-  if (dims.length === 3) {
-    if (dims[1] === 56) {
-      // [1, 56, N] — CHW
-      numDet = dims[2];
-      isHWC  = false;
-    } else {
-      // [1, N, 56] — HWC
-      numDet = dims[1];
-      isHWC  = true;
-    }
-  } else {
-    // fallback: assume HWC with 8400 dets
-    numDet = 8400;
-    isHWC  = true;
-  }
-
-  // ── Find best detection ───────────────────────────────────────────────────
-  let bestConf = confThresh;
-  let bestOffset = -1;
-  let debugMaxConf = 0;
-
-  for (let d = 0; d < numDet; d++) {
-    const conf = isHWC
-      ? data[d * 56 + 4]       // HWC: row d, col 4
-      : data[4 * numDet + d];  // CHW: row 4, col d
-    if (conf > debugMaxConf) debugMaxConf = conf;
-    if (conf > bestConf) {
-      bestConf   = conf;
-      bestOffset = d;
-    }
-  }
-
-  // Debug log (ลบทิ้งหลัง confirm)
-  console.log(
-    `[YOLO] shape=${dims.join("×")} layout=${isHWC ? "HWC" : "CHW"} ` +
-    `numDet=${numDet} maxConf=${debugMaxConf.toFixed(3)} ` +
-    `threshold=${confThresh} bestOffset=${bestOffset}`,
-  );
-
-  if (bestOffset === -1) return null;
-
-  // ── Extract 17 keypoints ──────────────────────────────────────────────────
-  const d = bestOffset;
-  const kps: Kp[] = [];
-
-  for (let k = 0; k < 17; k++) {
-    let px: number, py: number, pc: number;
-
-    if (isHWC) {
-      // [1, N, 56]: det d → base = d*56, kp k → +5+k*3
-      const base = d * 56 + 5 + k * 3;
-      px = data[base];
-      py = data[base + 1];
-      pc = data[base + 2];
-    } else {
-      // [1, 56, N]: row r → r*numDet + d
-      const base = (5 + k * 3) * numDet;
-      px = data[base + d];
-      py = data[base + numDet + d];
-      pc = data[base + 2 * numDet + d];
-    }
-
-    kps.push({
-      x: Math.max(0, Math.min(origW, (px - padX) / scale)),
-      y: Math.max(0, Math.min(origH, (py - padY) / scale)),
-      conf: pc,
-    });
-  }
-
-  return kps;
+function applyPrediction(kps: Kp[], vel: Vel[] | null, aheadSec: number): Kp[] {
+  if (!vel || aheadSec <= 0) return kps;
+  return kps.map((k, i) => ({
+    x: k.x + vel[i].vx * aheadSec,
+    y: k.y + vel[i].vy * aheadSec,
+    conf: k.conf,
+  }));
 }
 
 // ─── Rep Counter ─────────────────────────────────────────────────────────────
@@ -331,11 +242,20 @@ function PoseAnalyzer() {
   // model state
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadMsg,   setLoadMsg]   = useState("");
-  const yoloRef      = useRef<ort.InferenceSession | null>(null);
-  const poseRfRef    = useRef<ort.InferenceSession | null>(null);
-  const formClfRef   = useRef<ort.InferenceSession | null>(null);
-  const metaRef      = useRef<ModelMeta | null>(null);
-  const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const yoloWorkerRef    = useRef<Worker | null>(null);
+  const workerReadyRef   = useRef(false);
+  const poseRfRef        = useRef<ort.InferenceSession | null>(null);
+  const formClfRef       = useRef<ort.InferenceSession | null>(null);
+  const metaRef          = useRef<ModelMeta | null>(null);
+  const analyzingRef     = useRef(false);
+  const inferBusyRef     = useRef(false);
+  const inferFrameRef    = useRef(0);
+  const inferIdRef       = useRef(0);
+  const videoFrameCbRef  = useRef<number | undefined>(undefined);
+  const prevTargetRef    = useRef<Kp[] | null>(null);
+  const prevTargetTimeRef = useRef(0);
+  const velocityRef      = useRef<Vel[] | null>(null);
+  const lastDetectTimeRef = useRef(0);
 
   // session state
   const [videoSrc,   setVideoSrc]   = useState<string | null>(null);
@@ -348,19 +268,80 @@ function PoseAnalyzer() {
   const [repCount,   setRepCount]   = useState(0);
   const [latency,    setLatency]    = useState(0);
   const [frameCount, setFrameCount] = useState(0);
+  const [trackStatus, setTrackStatus] = useState("");
 
   const videoRef       = useRef<HTMLVideoElement>(null);
   const canvasRef      = useRef<HTMLCanvasElement>(null);
-  const timerRef       = useRef<ReturnType<typeof setTimeout>>();   // ✅ FIX v4
-  const isProcessing   = useRef(false);                             // ✅ FIX v4: ป้องกัน queue ซ้อน
+  const drawRafRef     = useRef<number | undefined>(undefined);
+  const isProcessing   = useRef(false);
+
+  // display refs — updated by inference, rendered at 60fps
+  const targetKpsRef    = useRef<Kp[] | null>(null);
+  const displayKpsRef   = useRef<Kp[] | null>(null);
+  const lastResultRef   = useRef<FrameResult | null>(null);
+  const lastUiUpdateRef = useRef(0);
 
   // mutable refs (no re-render)
   const repCtrRef   = useRef(new RepCounter());
   const goodRef     = useRef(0);
   const totalRef    = useRef(0);
+  const applyClassificationRef = useRef<((kps: Kp[]) => Promise<void>) | undefined>(undefined);
+
+  const handleWorkerMessage = useCallback((ev: MessageEvent) => {
+    const data = ev.data as {
+      type: string;
+      id?: number;
+      kps?: Kp[] | null;
+      ms?: number;
+      message?: string;
+    };
+
+    if (data.type === "error") {
+      console.error("[yolo-worker]", data.message);
+      inferBusyRef.current = false;
+      setTrackStatus("inference error");
+      return;
+    }
+
+    if (data.type !== "result") return;
+
+    inferBusyRef.current = false;
+    const vid = videoRef.current;
+    const cvs = canvasRef.current;
+    if (!vid || !cvs) return;
+
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    if (data.kps && vw && vh) {
+      const canvasKps = videoKpsToCanvas(data.kps, vw, vh, cvs.width, cvs.height);
+      const now = performance.now();
+      velocityRef.current = updateVelocity(prevTargetRef.current, canvasKps, prevTargetTimeRef.current, now);
+      prevTargetRef.current = canvasKps;
+      prevTargetTimeRef.current = now;
+      lastDetectTimeRef.current = now;
+      targetKpsRef.current = canvasKps;
+      if (!displayKpsRef.current) displayKpsRef.current = canvasKps;
+
+      inferFrameRef.current++;
+      setLatency(data.ms ?? 0);
+      setTrackStatus(`tracking · ${data.ms}ms`);
+
+      const runClassify = inferFrameRef.current % CLASSIFY_EVERY_N === 0;
+      if (runClassify || !lastResultRef.current) {
+        void applyClassificationRef.current?.(data.kps);
+      }
+    } else {
+      setTrackStatus("no person detected");
+    }
+  }, []);
 
   // ── Load all models ──────────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
+    if (workerReadyRef.current && yoloWorkerRef.current) {
+      setLoadState("ready");
+      setLoadMsg("โมเดลพร้อมใช้งาน");
+      return;
+    }
     setLoadState("loading");
     try {
       setLoadMsg("โหลด model_meta.json…");
@@ -368,9 +349,30 @@ function PoseAnalyzer() {
       if (!metaRes.ok) throw new Error("ไม่พบ model_meta_export.json ใน public/models/");
       metaRef.current = await metaRes.json();
 
-      setLoadMsg("โหลด YOLOv8-Pose ONNX (~6 MB)…");
-      yoloRef.current = await ort.InferenceSession.create(`${MODEL_BASE}/yolov8n-pose.onnx`, {
-        executionProviders: ["wasm"],
+      setLoadMsg("โหลด YOLOv8-Pose (worker)…");
+      const worker = new Worker(
+        new URL("../workers/pose-yolo.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+      yoloWorkerRef.current = worker;
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error("YOLO worker timeout")), 120_000);
+        worker.onmessage = (ev) => {
+          const data = ev.data as { type: string; message?: string };
+          if (data.type === "ready") {
+            workerReadyRef.current = true;
+            window.clearTimeout(timeout);
+            worker.onmessage = handleWorkerMessage;
+            resolve();
+          } else if (data.type === "error") {
+            window.clearTimeout(timeout);
+            reject(new Error(data.message ?? "YOLO worker failed"));
+          }
+        };
+        worker.postMessage({
+          type: "init",
+          modelUrl: `${window.location.origin}${MODEL_BASE}/yolov8n-pose.onnx`,
+        });
       });
 
       setLoadMsg("โหลด Pose Classifier ONNX…");
@@ -383,12 +385,6 @@ function PoseAnalyzer() {
         executionProviders: ["wasm"],
       });
 
-      tmpCanvasRef.current = document.createElement("canvas");
-
-      // debug: log output names ครั้งเดียว (ลบทิ้งหลัง confirm)
-      console.log("[pose_rf]  outputNames:", poseRfRef.current!.outputNames);
-      console.log("[form_clf] outputNames:", formClfRef.current!.outputNames);
-
       setLoadState("ready");
       setLoadMsg("โมเดลพร้อมใช้งาน");
       toast.success("โหลดโมเดลสำเร็จ ✅");
@@ -397,110 +393,162 @@ function PoseAnalyzer() {
       setLoadMsg(err.message);
       toast.error("โหลดโมเดลล้มเหลว: " + err.message);
     }
-  }, []);
+  }, [handleWorkerMessage]);
 
-  // ── Process one frame (non-blocking, snapshot-based) ────────────────────────
-  //
-  // ✅ FIX v5:
-  //   Video เล่น realtime ตลอด ไม่ถูก block
-  //   Inference ดึง snapshot จาก video.currentTime ณ ขณะนั้น
-  //   Canvas วาด skeleton ทับ video ปัจจุบัน (ไม่ใช่ frame เก่า)
-  //   Schedule ครั้งต่อไปหลัง inference จบเท่านั้น → ไม่มี queue ซ้อน
+  const drawLoopRef = useRef<(() => void) | undefined>(undefined);
+  const captureFrameRef = useRef<() => void>(() => {});
 
-  const INFER_INTERVAL = 50; // ms หลัง inference จบ ก็ schedule ต่อทันที
-
-  const processFrameRef = useRef<() => Promise<void>>();
-
-  const processFrame = useCallback(async () => {
-    if (isProcessing.current) return; // double-guard
-
-    const vid = videoRef.current;
-    const cvs = canvasRef.current;
-    if (!vid || !cvs || vid.paused || vid.ended) return;
-    if (!yoloRef.current || !poseRfRef.current || !formClfRef.current || !metaRef.current) return;
+  const applyClassification = useCallback(async (kps: Kp[]) => {
+    if (!poseRfRef.current || !formClfRef.current || !metaRef.current) return;
+    if (isProcessing.current) return;
 
     isProcessing.current = true;
     const t0 = performance.now();
-
     try {
-      // 1. Snapshot frame ณ เวลา currentTime — video ยังเล่นต่อได้เลย
-      const { tensor, scale, padX, padY } = preprocessFrame(vid, tmpCanvasRef.current!);
-
-      // 2. YOLOv8 inference (async — ไม่บล็อก UI thread)
-      const yoloOut = await yoloRef.current.run({ images: tensor });
-      const output  = yoloOut[Object.keys(yoloOut)[0]];
-
-      const kps = postprocessYolo(
-        output, CONF_THRESH,
-        scale, padX, padY,
-        vid.videoWidth, vid.videoHeight,
+      const res = await runClassifiers(
+        kps, poseRfRef.current, formClfRef.current, metaRef.current,
       );
+      lastResultRef.current = res;
 
-      // 3. วาด canvas overlay ทับ video ณ ปัจจุบัน (ไม่ใช่ frame เก่า)
-      const ctx = cvs.getContext("2d")!;
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      repCtrRef.current.update(res.features["left_knee"] ?? 180);
+      totalRef.current++;
+      if (res.form === "Good") goodRef.current++;
 
-      if (kps) {
-        const res = await runClassifiers(
-          kps, poseRfRef.current, formClfRef.current, metaRef.current,
-        );
-
-        // Rep counting
-        repCtrRef.current.update(res.features["left_knee"] ?? 180);
+      const now = performance.now();
+      if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
+        lastUiUpdateRef.current = now;
         setRepCount(repCtrRef.current.count);
-
-        // Form score
-        totalRef.current++;
-        if (res.form === "Good") goodRef.current++;
         setFormScore(
           totalRef.current > 0
             ? Math.round((goodRef.current / totalRef.current) * 100)
             : 0,
         );
-
-        // UI state
         setExercise(res.exercise);
         setPoseConf(res.poseConf);
         setForm(res.form);
         setFormConf(res.formConf);
         setFrameCount((n) => n + 1);
-
-        // Draw skeleton
-        drawResults(ctx, kps, res, vid.videoWidth, vid.videoHeight, cvs.width, cvs.height);
       }
-
       setLatency(Math.round(performance.now() - t0));
     } catch (e) {
-      console.error("[processFrame]", e);
+      console.error("[classify]", e);
     } finally {
       isProcessing.current = false;
-      // Schedule ต่อทันทีหลัง inference จบ — video ยังเล่นอยู่
-      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended) {
-        timerRef.current = setTimeout(() => processFrameRef.current?.(), INFER_INTERVAL);
-      }
     }
   }, []);
 
-  // sync ref เสมอ
-  useEffect(() => { processFrameRef.current = processFrame; }, [processFrame]);
+  useEffect(() => {
+    applyClassificationRef.current = applyClassification;
+  }, [applyClassification]);
+
+  // ── 60fps render loop ───────────────────────────────────────────────────────
+  const drawLoop = useCallback(() => {
+    if (!analyzingRef.current) return;
+
+    const vid = videoRef.current;
+    const cvs = canvasRef.current;
+    if (vid && cvs) {
+      let target = targetKpsRef.current;
+      if (target) {
+        const ahead = Math.min(PREDICT_MS, performance.now() - lastDetectTimeRef.current) / 1000;
+        target = applyPrediction(target, velocityRef.current, ahead * 0.85);
+        displayKpsRef.current = lerpKeypoints(displayKpsRef.current, target, DISPLAY_LERP);
+      }
+
+      const kps = displayKpsRef.current;
+      const ctx = cvs.getContext("2d")!;
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+
+      if (kps?.some((k) => k.conf > 0.1)) {
+        drawResults(
+          ctx,
+          kps,
+          lastResultRef.current ?? {
+            exercise: "—", poseConf: 0, form: "N/A", formConf: 0, hasError: false, features: {},
+          },
+          cvs.width,
+          cvs.height,
+        );
+      }
+    }
+
+    drawRafRef.current = requestAnimationFrame(() => drawLoopRef.current?.());
+  }, []);
+
+  useEffect(() => { drawLoopRef.current = drawLoop; }, [drawLoop]);
+
+  // ── Capture one video frame → YOLO worker (synced to video refresh rate) ─────
+  const captureFrame = useCallback(() => {
+    if (!analyzingRef.current) return;
+
+    const vid = videoRef.current;
+    const worker = yoloWorkerRef.current;
+    if (!vid || !worker || !workerReadyRef.current || vid.ended) return;
+
+    if (inferBusyRef.current || vid.readyState < 2) return;
+
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    if (!vw || !vh) return;
+
+    inferBusyRef.current = true;
+    const id = ++inferIdRef.current;
+
+    void createImageBitmap(vid)
+      .then((bitmap) => {
+        worker.postMessage(
+          { type: "infer", id, bitmap, vw, vh, conf: CONF_THRESH },
+          [bitmap],
+        );
+      })
+      .catch((e) => {
+        console.error("[capture]", e);
+        inferBusyRef.current = false;
+      });
+  }, []);
+
+  useEffect(() => {
+    captureFrameRef.current = captureFrame;
+  }, [captureFrame]);
+
+  const scheduleVideoFrameCapture = useCallback((vid: HTMLVideoElement) => {
+    type VFC = (cb: (now: number, meta: VideoFrameCallbackMetadata) => void) => number;
+    const rvfc = (vid as HTMLVideoElement & { requestVideoFrameCallback?: VFC })
+      .requestVideoFrameCallback;
+
+    if (rvfc) {
+      videoFrameCbRef.current = rvfc.call(vid, () => {
+        if (!analyzingRef.current || vid.ended) return;
+        captureFrameRef.current();
+        scheduleVideoFrameCapture(vid);
+      });
+    } else {
+      window.setTimeout(() => {
+        if (!analyzingRef.current || vid.ended) return;
+        captureFrameRef.current();
+        scheduleVideoFrameCapture(vid);
+      }, 42); // ~24fps fallback
+    }
+  }, []);
 
   // ── Draw skeleton + overlay ──────────────────────────────────────────────────
   function drawResults(
     ctx: CanvasRenderingContext2D,
     kps: Kp[],
     res: FrameResult,
-    origW: number, origH: number,
-    cvW: number, cvH: number,
+    cvW: number,
+    cvH: number,
   ) {
-    const sx = cvW / origW, sy = cvH / origH;
-    const px = (k: Kp) => k.x * sx, py = (k: Kp) => k.y * sy;
+    const px = (k: Kp) => k.x;
+    const py = (k: Kp) => k.y;
+    const KP_MIN = 0.1;
 
     const color = res.form === "Good" ? "#22c55e" : res.form === "Bad" ? "#ef4444" : "#d4ff3a";
 
     // bounding box
-    const visKps = kps.filter((k) => k.conf > 0.3);
+    const visKps = kps.filter((k) => k.conf > KP_MIN);
     if (visKps.length > 0) {
-      const xs = visKps.map((k) => k.x * sx), ys = visKps.map((k) => k.y * sy);
+      const xs = visKps.map((k) => k.x), ys = visKps.map((k) => k.y);
       const bx = Math.max(0, Math.min(...xs) - 12);
       const by = Math.max(0, Math.min(...ys) - 12);
       const bw = Math.min(cvW - bx, Math.max(...xs) - Math.min(...xs) + 24);
@@ -518,7 +566,7 @@ function PoseAnalyzer() {
 
     // skeleton
     for (const [a, b] of SKELETON) {
-      if (kps[a]?.conf > 0.3 && kps[b]?.conf > 0.3) {
+      if (kps[a]?.conf > KP_MIN && kps[b]?.conf > KP_MIN) {
         ctx.strokeStyle = color; ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(px(kps[a]), py(kps[a]));
@@ -529,7 +577,7 @@ function PoseAnalyzer() {
 
     // joints
     for (const kp of kps) {
-      if (kp.conf > 0.3) {
+      if (kp.conf > KP_MIN) {
         ctx.fillStyle = "#fff";
         ctx.beginPath();
         ctx.arc(px(kp), py(kp), 4, 0, Math.PI * 2);
@@ -543,16 +591,48 @@ function PoseAnalyzer() {
     if (!videoRef.current || !videoSrc || loadState !== "ready") return;
     repCtrRef.current = new RepCounter();
     goodRef.current = totalRef.current = 0;
+    targetKpsRef.current = null;
+    displayKpsRef.current = null;
+    lastResultRef.current = null;
+    inferFrameRef.current = 0;
+    prevTargetRef.current = null;
+    velocityRef.current = null;
+    lastDetectTimeRef.current = performance.now();
     setRepCount(0); setFormScore(0); setFrameCount(0);
-    videoRef.current.currentTime = 0;
-    await videoRef.current.play();
+    setTrackStatus("starting…");
+
+    const vid = videoRef.current;
+    if (vid.readyState < 2) {
+      await new Promise<void>((resolve) => {
+        vid.addEventListener("loadeddata", () => resolve(), { once: true });
+      });
+    }
+
+    const cvs = canvasRef.current;
+    if (cvs && vid.videoWidth && vid.videoHeight) {
+      cvs.width = vid.videoWidth;
+      cvs.height = vid.videoHeight;
+    }
+
+    vid.currentTime = 0;
+    await vid.play();
     isProcessing.current = false;
+    inferBusyRef.current = false;
+    analyzingRef.current = true;
     setAnalyzing(true);
-    timerRef.current = setTimeout(() => processFrameRef.current?.(), 0); // ✅ FIX v4
+
+    requestAnimationFrame(() => {
+      drawRafRef.current = requestAnimationFrame(() => drawLoopRef.current?.());
+      captureFrameRef.current();
+      scheduleVideoFrameCapture(vid);
+    });
   };
 
   const stopAnalysis = useCallback(async () => {
-    if (timerRef.current) clearTimeout(timerRef.current);  // ✅ FIX v4
+    analyzingRef.current = false;
+    if (drawRafRef.current) cancelAnimationFrame(drawRafRef.current);
+    videoFrameCbRef.current = undefined;
+    setTrackStatus("");
     videoRef.current?.pause();
     setAnalyzing(false);
 
@@ -586,8 +666,15 @@ function PoseAnalyzer() {
 
   useEffect(() => () => {
     if (videoSrc) URL.revokeObjectURL(videoSrc);
-    if (timerRef.current) clearTimeout(timerRef.current);   // ✅ FIX v4
+    if (drawRafRef.current) cancelAnimationFrame(drawRafRef.current);
+    analyzingRef.current = false;
   }, [videoSrc]);
+
+  useEffect(() => () => {
+    yoloWorkerRef.current?.terminate();
+    yoloWorkerRef.current = null;
+    workerReadyRef.current = false;
+  }, []);
 
   const { data: history } = useQuery({
     queryKey: ["pose-history", user?.id],
@@ -615,7 +702,7 @@ function PoseAnalyzer() {
       {/* Header */}
       <div>
         <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-primary">
-          <Cpu className="h-3 w-3" /> YOLOv8-Pose + Random Forest · ONNX Runtime
+          <Cpu className="h-3 w-3" /> YOLOv8-Pose + Random Forest · ONNX
         </div>
         <h1 className="mt-1 font-display text-4xl font-bold">Pose Analysis</h1>
         <p className="mt-2 text-muted-foreground">
@@ -672,9 +759,19 @@ function PoseAnalyzer() {
               <video
                 ref={videoRef}
                 src={videoSrc}
-                playsInline muted
+                playsInline
+                muted
+                preload="auto"
                 className="h-full w-full object-contain"
                 onEnded={stopAnalysis}
+                onLoadedMetadata={(e) => {
+                  const v = e.currentTarget;
+                  const cvs = canvasRef.current;
+                  if (cvs && v.videoWidth && v.videoHeight) {
+                    cvs.width = v.videoWidth;
+                    cvs.height = v.videoHeight;
+                  }
+                }}
               />
             ) : (
               <div className="flex flex-col items-center gap-4 p-12 text-center">
@@ -692,11 +789,10 @@ function PoseAnalyzer() {
             {/* Overlay canvas */}
             <canvas
               ref={canvasRef}
-              width={1280} height={720}
-              className={cn(
-                "absolute inset-0 h-full w-full pointer-events-none",
-                !analyzing && "hidden",
-              )}
+              width={1280}
+              height={720}
+              className="absolute inset-0 h-full w-full object-contain pointer-events-none"
+              style={{ opacity: analyzing ? 1 : 0 }}
             />
 
             {/* HUD */}
@@ -706,10 +802,11 @@ function PoseAnalyzer() {
                 <div className="absolute left-4 top-4 flex flex-col gap-1.5">
                   <div className="flex items-center gap-2 rounded-full bg-primary/90 px-3 py-1 text-[10px] font-bold text-primary-foreground">
                     <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
-                    YOLOv8 + RF LIVE
+                    YOLO LIVE
                   </div>
                   <div className="flex items-center gap-2 rounded-full bg-black/60 px-3 py-1 text-[10px] font-mono text-white backdrop-blur">
                     <Target className="h-3 w-3" /> {latency}ms · f{frameCount}
+                    {trackStatus && ` · ${trackStatus}`}
                   </div>
                   {form === "Good" && (
                     <div className="flex items-center gap-2 rounded-full bg-green-500/90 px-3 py-1 text-xs font-bold text-white animate-in zoom-in">
