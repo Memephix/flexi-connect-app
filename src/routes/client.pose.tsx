@@ -10,6 +10,14 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import {
+  type ExerciseMode,
+  EXERCISE_OPTIONS,
+  exerciseUsesOnnx,
+  exerciseLabel,
+  createSquatRepCounter,
+  ExerciseEngine,
+} from "@/lib/exercise-eval";
 import * as ort from "onnxruntime-web";
 
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
@@ -153,22 +161,6 @@ function applyPrediction(kps: Kp[], vel: Vel[] | null, aheadSec: number): Kp[] {
   }));
 }
 
-// ─── Rep Counter ─────────────────────────────────────────────────────────────
-
-class RepCounter {
-  count = 0;
-  stage: "up" | "down" = "up";
-  constructor(readonly upThresh = 150, readonly downThresh = 100) {}
-  update(kneeAngle: number): number {
-    if (kneeAngle > this.upThresh) this.stage = "up";
-    else if (kneeAngle < this.downThresh && this.stage === "up") {
-      this.stage = "down";
-      this.count++;
-    }
-    return this.count;
-  }
-}
-
 // ─── Model Runner ─────────────────────────────────────────────────────────────
 
 async function runClassifiers(
@@ -259,6 +251,7 @@ function PoseAnalyzer() {
 
   // session state
   const [videoSrc,   setVideoSrc]   = useState<string | null>(null);
+  const [exerciseMode, setExerciseMode] = useState<ExerciseMode>("squat");
   const [analyzing,  setAnalyzing]  = useState(false);
   const [exercise,   setExercise]   = useState("—");
   const [poseConf,   setPoseConf]   = useState(0);
@@ -282,10 +275,16 @@ function PoseAnalyzer() {
   const lastUiUpdateRef = useRef(0);
 
   // mutable refs (no re-render)
-  const repCtrRef   = useRef(new RepCounter());
-  const goodRef     = useRef(0);
-  const totalRef    = useRef(0);
+  const exerciseModeRef = useRef<ExerciseMode>("squat");
+  const engineRef       = useRef(new ExerciseEngine());
+  const repCtrRef       = useRef(createSquatRepCounter());
+  const goodRef         = useRef(0);
+  const totalRef        = useRef(0);
   const applyClassificationRef = useRef<((kps: Kp[]) => Promise<void>) | undefined>(undefined);
+
+  useEffect(() => {
+    exerciseModeRef.current = exerciseMode;
+  }, [exerciseMode]);
 
   const handleWorkerMessage = useCallback((ev: MessageEvent) => {
     const data = ev.data as {
@@ -326,7 +325,10 @@ function PoseAnalyzer() {
       setLatency(data.ms ?? 0);
       setTrackStatus(`tracking · ${data.ms}ms`);
 
-      const runClassify = inferFrameRef.current % CLASSIFY_EVERY_N === 0;
+      const mode = exerciseModeRef.current;
+      const runClassify =
+        !exerciseUsesOnnx(mode) ||
+        inferFrameRef.current % CLASSIFY_EVERY_N === 0;
       if (runClassify || !lastResultRef.current) {
         void applyClassificationRef.current?.(data.kps);
       }
@@ -398,44 +400,87 @@ function PoseAnalyzer() {
   const drawLoopRef = useRef<(() => void) | undefined>(undefined);
   const captureFrameRef = useRef<() => void>(() => {});
 
-  const applyClassification = useCallback(async (kps: Kp[]) => {
-    if (!poseRfRef.current || !formClfRef.current || !metaRef.current) return;
-    if (isProcessing.current) return;
-
-    isProcessing.current = true;
-    const t0 = performance.now();
-    try {
-      const res = await runClassifiers(
-        kps, poseRfRef.current, formClfRef.current, metaRef.current,
+  const syncUiFromResult = useCallback((
+    exerciseName: string,
+    pose: number,
+    formLabel: string,
+    formC: number,
+    reps: number,
+  ) => {
+    const now = performance.now();
+    if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
+      lastUiUpdateRef.current = now;
+      setRepCount(reps);
+      setFormScore(
+        totalRef.current > 0
+          ? Math.round((goodRef.current / totalRef.current) * 100)
+          : 0,
       );
-      lastResultRef.current = res;
-
-      repCtrRef.current.update(res.features["left_knee"] ?? 180);
-      totalRef.current++;
-      if (res.form === "Good") goodRef.current++;
-
-      const now = performance.now();
-      if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
-        lastUiUpdateRef.current = now;
-        setRepCount(repCtrRef.current.count);
-        setFormScore(
-          totalRef.current > 0
-            ? Math.round((goodRef.current / totalRef.current) * 100)
-            : 0,
-        );
-        setExercise(res.exercise);
-        setPoseConf(res.poseConf);
-        setForm(res.form);
-        setFormConf(res.formConf);
-        setFrameCount((n) => n + 1);
-      }
-      setLatency(Math.round(performance.now() - t0));
-    } catch (e) {
-      console.error("[classify]", e);
-    } finally {
-      isProcessing.current = false;
+      setExercise(exerciseName);
+      setPoseConf(pose);
+      setForm(formLabel);
+      setFormConf(formC);
+      setFrameCount((n) => n + 1);
     }
   }, []);
+
+  const applyClassification = useCallback(async (kps: Kp[]) => {
+    const mode = exerciseModeRef.current;
+
+    if (exerciseUsesOnnx(mode)) {
+      if (!poseRfRef.current || !formClfRef.current || !metaRef.current) return;
+      if (isProcessing.current) return;
+
+      isProcessing.current = true;
+      const t0 = performance.now();
+      try {
+        const res = await runClassifiers(
+          kps, poseRfRef.current, formClfRef.current, metaRef.current,
+        );
+        lastResultRef.current = res;
+
+        const knee = res.features["left_knee"] ?? res.features["right_knee"] ?? 180;
+        repCtrRef.current.update(knee);
+        totalRef.current++;
+        if (res.form === "Good") goodRef.current++;
+
+        syncUiFromResult(
+          res.exercise,
+          res.poseConf,
+          res.form,
+          res.formConf,
+          repCtrRef.current.count,
+        );
+        setLatency(Math.round(performance.now() - t0));
+      } catch (e) {
+        console.error("[classify]", e);
+      } finally {
+        isProcessing.current = false;
+      }
+      return;
+    }
+
+    const evalRes = engineRef.current.evaluate(mode, kps, performance.now());
+    lastResultRef.current = {
+      exercise: evalRes.exercise,
+      poseConf: evalRes.poseConf,
+      form: evalRes.form,
+      formConf: evalRes.formConf,
+      hasError: evalRes.form === "Bad",
+      features: evalRes.features,
+    };
+
+    totalRef.current++;
+    if (evalRes.goodFrame) goodRef.current++;
+
+    syncUiFromResult(
+      evalRes.exercise,
+      evalRes.poseConf,
+      evalRes.form,
+      evalRes.formConf,
+      evalRes.reps,
+    );
+  }, [syncUiFromResult]);
 
   useEffect(() => {
     applyClassificationRef.current = applyClassification;
@@ -589,7 +634,8 @@ function PoseAnalyzer() {
   // ── Start / Stop ─────────────────────────────────────────────────────────────
   const startAnalysis = async () => {
     if (!videoRef.current || !videoSrc || loadState !== "ready") return;
-    repCtrRef.current = new RepCounter();
+    repCtrRef.current = createSquatRepCounter();
+    engineRef.current.reset();
     goodRef.current = totalRef.current = 0;
     targetKpsRef.current = null;
     displayKpsRef.current = null;
@@ -637,23 +683,29 @@ function PoseAnalyzer() {
     setAnalyzing(false);
 
     if (totalRef.current > 0 && user) {
+      const mode = exerciseModeRef.current;
+      const reps = exerciseUsesOnnx(mode)
+        ? repCtrRef.current.count
+        : engineRef.current.getReps(mode);
       const score = Math.round((goodRef.current / totalRef.current) * 100);
+      const repLabel = mode === "plank" ? "วินาที" : "reps";
       const { error } = await supabase.from("pose_sessions").insert({
         client_id:      user.id,
-        exercise_name:  exercise,
+        exercise_name:  exerciseLabel(mode),
         accuracy_score: score,
         feedback_json: {
-          engine: "yolov8-pose+onnx",
-          reps: repCtrRef.current.count,
+          engine: exerciseUsesOnnx(mode) ? "yolov8-pose+onnx" : "yolov8-pose+rules",
+          mode,
+          reps,
           frames: totalRef.current,
           good_frames: goodRef.current,
         },
       });
       if (!error)
-        toast.success(`บันทึกแล้ว · ${score}% form · ${repCtrRef.current.count} reps`);
+        toast.success(`บันทึกแล้ว · ${score}% form · ${reps} ${repLabel}`);
       qc.invalidateQueries({ queryKey: ["pose-history"] });
     }
-  }, [exercise, user, qc]);
+  }, [user, qc]);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -829,9 +881,11 @@ function PoseAnalyzer() {
                   </div>
                 </div>
 
-                {/* bottom-left: reps */}
+                {/* bottom-left: reps / hold */}
                 <div className="absolute left-4 bottom-16 rounded-lg bg-background/90 px-4 py-2 text-center backdrop-blur border border-primary/20">
-                  <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Reps</div>
+                  <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                    {exerciseMode === "plank" ? "Hold (s)" : "Reps"}
+                  </div>
                   <div className="font-display text-3xl font-bold text-primary">{repCount}</div>
                 </div>
 
@@ -882,13 +936,44 @@ function PoseAnalyzer() {
 
         {/* Sidebar */}
         <div className="space-y-4">
+          {/* Exercise mode */}
+          <div className="rounded-xl border border-border bg-card p-4 space-y-2">
+            <div className="text-xs uppercase tracking-widest text-muted-foreground">ท่าออกกำลังกาย</div>
+            <select
+              value={exerciseMode}
+              disabled={analyzing}
+              onChange={(e) => {
+                const mode = e.target.value as ExerciseMode;
+                setExerciseMode(mode);
+                setExercise(exerciseLabel(mode));
+                setForm("N/A");
+                setRepCount(0);
+                setFormScore(0);
+                lastResultRef.current = null;
+              }}
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-medium disabled:opacity-50"
+            >
+              {EXERCISE_OPTIONS.map((o) => (
+                <option key={o.id} value={o.id}>{o.label}</option>
+              ))}
+            </select>
+            <p className="text-[10px] text-muted-foreground">
+              {exerciseUsesOnnx(exerciseMode)
+                ? "ใช้ ONNX classifier (Squat)"
+                : "ใช้ rule-based จาก keypoints"}
+            </p>
+          </div>
+
           {/* Live stats */}
           <div className="rounded-xl border border-border bg-card p-4 space-y-3">
             <div className="text-xs uppercase tracking-widest text-muted-foreground">สถิติ Live</div>
             <Row label="ท่าที่พบ"     value={exercise} />
             <Row label="Form"          value={form} valueClass={formColor} />
             <Row label="Form Score"    value={`${formScore}%`} />
-            <Row label="Reps"          value={String(repCount)} />
+            <Row
+              label={exerciseMode === "plank" ? "Hold (s)" : "Reps"}
+              value={String(repCount)}
+            />
             <Row label="Pose Conf"     value={`${(poseConf * 100).toFixed(1)}%`} />
             <Row label="Form Conf"     value={`${(formConf * 100).toFixed(1)}%`} />
             <Row label="Latency/frame" value={`${latency} ms`} mono />
